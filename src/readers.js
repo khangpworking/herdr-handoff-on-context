@@ -199,6 +199,11 @@ function firstLine(path, maxBytes = 256 * 1024) {
   }
 }
 
+// /proc start times drift from wall-clock time after suspend (seen: +2 min
+// on a laptop up 6 days), so allow generous slack. It only has to rule out
+// rollouts from earlier codex runs in the same folder.
+const START_SLACK_MS = 15 * 60 * 1000;
+
 export function codexRolloutFor(cwd, startMs, env = process.env, nowMs = Date.now()) {
   if (!cwd || !startMs) return undefined;
   const root = sessionRoots(env).codex.root;
@@ -222,7 +227,7 @@ export function codexRolloutFor(cwd, startMs, env = process.env, nowMs = Date.no
         continue;
       }
       const created = Date.parse(meta?.timestamp ?? "");
-      if (meta?.cwd !== cwd || !(created >= startMs - 5000)) continue;
+      if (meta?.cwd !== cwd || !(created >= startMs - START_SLACK_MS)) continue;
       if (!best || created > best.created) best = { full, created };
     }
   }
