@@ -1,6 +1,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { claudeContext, codexContext, piContext, opencodeTokens, readContext } from "../src/readers.js";
+import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { claudeContext, codexContext, piContext, opencodeTokens, readContext, resolveSessionPath } from "../src/readers.js";
 
 const j = (...objs) => objs.map((o) => JSON.stringify(o));
 
@@ -38,6 +41,16 @@ test("opencode: same formula as the original plugin", () => {
 test("readContext: unknown when herdr reported no session", async () => {
   assert.equal(await readContext({ agent: "claude" }), undefined);
   assert.equal(await readContext({ agent: "zcode", agent_session: { kind: "path", value: "/x" } }), undefined);
+});
+
+test("resolveSessionPath: claude session id -> transcript under projects/", () => {
+  const home = mkdtempSync(join(tmpdir(), "cl-"));
+  mkdirSync(join(home, "projects", "-home-u-repo"), { recursive: true });
+  const file = join(home, "projects", "-home-u-repo", "abc-123.jsonl");
+  writeFileSync(file, "{}\n");
+  const agent = { agent: "claude", agent_session: { kind: "id", value: "abc-123" } };
+  assert.equal(resolveSessionPath(agent, { CLAUDE_CONFIG_DIR: home }), file);
+  assert.equal(resolveSessionPath({ ...agent, agent_session: { kind: "id", value: "nope" } }, { CLAUDE_CONFIG_DIR: home }), undefined);
 });
 
 test("readContext: opencode goes by session id", async () => {

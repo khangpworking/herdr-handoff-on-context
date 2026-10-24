@@ -10,7 +10,7 @@
 //   claude, codex, pi -> kind "path" (a JSONL transcript)
 //   opencode          -> kind "id"   (a row key in ~/.local/share/opencode/opencode.db)
 
-import { openSync, readSync, fstatSync, closeSync, existsSync } from "node:fs";
+import { openSync, readSync, fstatSync, closeSync, existsSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -125,6 +125,51 @@ const LINE_READERS = { claude: claudeContext, codex: codexContext, pi: piContext
 
 export const SUPPORTED_KINDS = ["claude", "codex", "opencode", "pi"];
 
+// Where each agent keeps its transcripts, and how a file name carries the
+// session id. Used when herdr reports a session id instead of a path (the
+// Claude integration does this).
+function sessionRoots(env = process.env) {
+  return {
+    claude: { root: join(env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "projects"), match: (name, id) => name === `${id}.jsonl` },
+    codex: { root: join(env.CODEX_HOME || join(homedir(), ".codex"), "sessions"), match: (name, id) => name.startsWith("rollout-") && name.endsWith(`${id}.jsonl`) },
+    pi: { root: join(homedir(), ".pi", "agent", "sessions"), match: (name, id) => name.endsWith(`_${id}.jsonl`) },
+  };
+}
+
+function findFile(dir, match, depth) {
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return undefined;
+  }
+  for (const e of entries) if (e.isFile() && match(e.name)) return join(dir, e.name);
+  if (depth <= 0) return undefined;
+  // Newest directories first: codex nests sessions by YYYY/MM/DD.
+  const dirs = entries.filter((e) => e.isDirectory()).map((e) => e.name).sort().reverse();
+  for (const d of dirs) {
+    const found = findFile(join(dir, d), match, depth - 1);
+    if (found) return found;
+  }
+  return undefined;
+}
+
+const pathCache = new Map();
+
+export function resolveSessionPath(agent, env = process.env) {
+  const s = agent?.agent_session;
+  if (!s?.value) return undefined;
+  if (s.kind === "path") return s.value;
+  const key = `${agent.agent}:${s.value}`;
+  const cached = pathCache.get(key);
+  if (cached && existsSync(cached)) return cached;
+  const where = sessionRoots(env)[agent.agent];
+  if (!where) return undefined;
+  const found = findFile(where.root, (name) => where.match(name, s.value), 3);
+  if (found) pathCache.set(key, found);
+  return found;
+}
+
 // agent: a herdr AgentInfo. Returns a token count, or undefined when unknown.
 export async function readContext(agent, deps = {}) {
   const kind = agent?.agent;
@@ -134,6 +179,7 @@ export async function readContext(agent, deps = {}) {
     return (deps.opencodeContext ?? opencodeContext)(session.value);
   }
   const reader = LINE_READERS[kind];
-  if (!reader || session.kind !== "path" || !existsSync(session.value)) return undefined;
-  return reader((deps.tailLines ?? tailLines)(session.value));
+  const path = reader && (deps.resolveSessionPath ?? resolveSessionPath)(agent);
+  if (!path || !existsSync(path)) return undefined;
+  return reader((deps.tailLines ?? tailLines)(path));
 }
