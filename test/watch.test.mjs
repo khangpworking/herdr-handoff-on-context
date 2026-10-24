@@ -203,3 +203,16 @@ test("handoff: codex review screen is closed with Escape before prompting, never
   const firstPrompt = herdr.calls.findIndex((c) => c[1] === "prompt");
   assert.ok(firstEsc < firstPrompt);
 });
+
+test("handoff: file name wrapped across lines in a narrow pane still counts as seen", async () => {
+  const { config } = setup();
+  mkdirSync(config.handoffDir, { recursive: true });
+  const file = join(config.handoffDir, "20261024-215827-codex-x1.md");
+  writeFileSync(file, "x".repeat(500));
+  const herdr = fakeHerdr(file, (args) =>
+    args[1] === "read" && args[2] === "x1-h2" ? { code: 0, stdout: "Read /h/20261024-2158\n  27-codex-x1.md first", stderr: "" } : undefined,
+  );
+  const r = await handoff({ agent: agent({ name: "x1" }), tokens: 160000, config, herdr, log: quiet, existingNames: new Set(), sleep: async () => {} });
+  assert.equal(r.ok, true);
+  assert.equal(herdr.calls.filter((c) => c[1] === "prompt" && c[2] === "x1-h2").length, 1);
+});

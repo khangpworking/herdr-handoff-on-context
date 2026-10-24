@@ -240,7 +240,9 @@ export async function sawHandoff(herdr, target, path, timeoutMs, sleep = sleepMs
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const out = (await herdr(["agent", "read", target, "--source", "recent-unwrapped", "--lines", "300"])).stdout;
-    if (out.includes(needle)) return true;
+    // Codex hard-wraps its own transcript to the pane width, which can split
+    // the file name across lines; compare with whitespace removed.
+    if (out.replace(/\s+/g, "").includes(needle)) return true;
     await sleep(2000);
   }
   return false;
