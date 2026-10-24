@@ -177,7 +177,17 @@ export function nextAgentName(agent, existingNames) {
   }
 }
 
-export function writePrompt({ agent, tokens, config, cwd }) {
+// The watcher picks the file name so two agents handing off in the same
+// minute never write to the same file.
+export function handoffPathFor(agent, config, nowMs = Date.now()) {
+  const d = new Date(nowMs);
+  const p2 = (x) => String(x).padStart(2, "0");
+  const stamp = `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}-${p2(d.getHours())}${p2(d.getMinutes())}${p2(d.getSeconds())}`;
+  const who = String(agent.name || agent.pane_id).replace(/[^A-Za-z0-9_-]/g, "_");
+  return join(config.handoffDir, `${stamp}-${agent.agent}-${who}.md`);
+}
+
+export function writePrompt({ agent, tokens, config, cwd, path }) {
   const how = existsSync(config.skillPath)
     ? `Read ${config.skillPath} and follow it to write a handoff document.`
     : "Write a handoff document: goal, current state, decisions and why, files touched, failed attempts, next concrete steps. Redact secrets.";
@@ -185,7 +195,7 @@ export function writePrompt({ agent, tokens, config, cwd }) {
     `Your context is at about ${Math.round(tokens / 1000)}k tokens, so this session now hands off to a fresh ${agent.agent} session.`,
     how,
     `The next session continues this same work in ${cwd}.`,
-    `Save the document in ${config.handoffDir}/ and do not change any other files.`,
+    `Save the document exactly as ${path} (not under any other name) and do not change any other files.`,
     `End your reply with one line exactly like: HANDOFF: <absolute path of the file>`,
   ].join(" ");
 }
@@ -197,6 +207,33 @@ export function resumePrompt(path) {
 // ---------------------------------------------------------------------------
 // Handoff
 // ---------------------------------------------------------------------------
+
+// Codex shows a hook-review screen at startup while a configured hook is not
+// trusted, and that screen swallows typed prompts. Esc closes it without
+// trusting anything.
+const CODEX_OVERLAY = /hook needs review|review required|Lifecycle hooks from config/i;
+
+export async function clearCodexOverlay(herdr, target, sleep = sleepMs) {
+  for (let i = 0; i < 3; i++) {
+    const screen = await herdr(["agent", "read", target, "--source", "visible"]);
+    if (!CODEX_OVERLAY.test(screen.stdout)) return;
+    await herdr(["agent", "send-keys", target, "Escape"]);
+    await sleep(800);
+  }
+}
+
+// Wait until the handoff file exists and stops growing.
+export async function waitForFile(path, timeoutMs, sleep = sleepMs) {
+  const deadline = Date.now() + timeoutMs;
+  let lastSize = -1;
+  while (Date.now() < deadline) {
+    const size = existsSync(path) ? statSync(path).size : -1;
+    if (size >= 200 && size === lastSize) return true;
+    lastSize = size;
+    await sleep(3000);
+  }
+  return false;
+}
 
 // `agent wait` fails fast with agent_not_found while the new agent is still
 // registering, so retry short slices until the deadline (from the original).
@@ -219,16 +256,30 @@ export async function handoff({ agent, tokens, config, herdr, log, existingNames
   mkdirSync(config.handoffDir, { recursive: true });
 
   // 1. Ask the old agent to write the handoff.
-  log.info("asking agent to write handoff", { target, kind: agent.agent, tokens });
-  const asked = await herdr(["agent", "prompt", target, writePrompt({ agent, tokens, config, cwd }), "--wait", "--timeout", String(config.writeTimeoutMs)], config.writeTimeoutMs + 10_000);
+  const wanted = handoffPathFor(agent, config, startedAt);
+  log.info("asking agent to write handoff", { target, kind: agent.agent, tokens, path: wanted });
+  if (agent.agent === "codex") await clearCodexOverlay(herdr, target, sleep);
+  const asked = await herdr(["agent", "prompt", target, writePrompt({ agent, tokens, config, cwd, path: wanted }), "--wait", "--timeout", String(config.writeTimeoutMs)], config.writeTimeoutMs + 10_000);
   const status = asked.json?.result?.agent?.agent_status;
-  if (asked.code !== 0 || status === "blocked") {
-    return { ok: false, step: "write", detail: (asked.stderr || asked.stdout).slice(0, 300) || `status ${status}` };
+  const errCode = asked.json?.error?.code;
+  if (status === "blocked" || errCode === "agent_blocked") {
+    return { ok: false, step: "write", detail: "agent is blocked on an approval or question" };
+  }
+  if (asked.code !== 0) {
+    // herdr did not see the turn (agent_prompt_stalled) or timed out; the
+    // prompt may still be running, so wait for the file itself.
+    log.warn("prompt not confirmed by herdr, waiting for the file", { target, error: errCode });
+    if (!(await waitForFile(wanted, config.writeTimeoutMs, sleep))) {
+      return { ok: false, step: "write", detail: (asked.stderr || asked.stdout).slice(0, 300) };
+    }
   }
 
-  // 2. Find the file: the printed HANDOFF line first, then the newest new file.
-  const read = await herdr(["agent", "read", target, "--source", "recent-unwrapped", "--lines", "200"]);
-  let path = parseHandoffPath(read.stdout);
+  // 2. Find the file: the requested path, then a printed HANDOFF line, then the newest new file.
+  let path = existsSync(wanted) ? wanted : undefined;
+  if (!path) {
+    const read = await herdr(["agent", "read", target, "--source", "recent-unwrapped", "--lines", "200"]);
+    path = parseHandoffPath(read.stdout);
+  }
   if (!path || !existsSync(path)) path = newestHandoffSince(config.handoffDir, startedAt - 1000);
   if (!path || !existsSync(path) || statSync(path).size < 200) {
     return { ok: false, step: "find-file", detail: `no handoff file found (parsed: ${path ?? "none"})` };
@@ -246,6 +297,10 @@ export async function handoff({ agent, tokens, config, herdr, log, existingNames
   }
 
   // 4. Hand over the file and confirm the new agent took it.
+  if (agent.agent === "codex") {
+    await sleep(3000);
+    await clearCodexOverlay(herdr, newName, sleep);
+  }
   await herdr(["agent", "prompt", newName, resumePrompt(path)]);
   const confirmed = await confirmWorking(herdr, newName, config.confirmTimeoutMs, sleep);
   if (!confirmed) {

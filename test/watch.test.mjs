@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadConfig, skipReason, parseHandoffPath, nextAgentName, handoff, pollOnce } from "../src/watch.js";
+import { loadConfig, skipReason, parseHandoffPath, nextAgentName, handoff, pollOnce, handoffPathFor } from "../src/watch.js";
 
 const quiet = { info() {}, warn() {}, error() {} };
 
@@ -146,4 +146,52 @@ test("pollOnce: hands off over threshold once; dry run and below threshold do no
   const dry = [];
   await pollOnce({ config: { ...config, dryRun: true }, herdr, log: quiet, state: { triggered: {} }, read: async () => 999999, doHandoff: async ({ agent: a }) => (dry.push(a), { ok: true }) });
   assert.equal(dry.length, 0);
+});
+
+test("handoffPathFor: two agents in the same second get different files", () => {
+  const { config } = setup();
+  const t = Date.parse("2026-10-24T14:52:00Z");
+  const a = handoffPathFor({ agent: "opencode", name: "o1" }, config, t);
+  const b = handoffPathFor({ agent: "pi", name: "p1" }, config, t);
+  assert.notEqual(a, b);
+  assert.match(a, /-opencode-o1\.md$/);
+});
+
+test("handoff: herdr misses the turn (prompt stalled) -> waits for the requested file", async () => {
+  const { config } = setup();
+  mkdirSync(config.handoffDir, { recursive: true });
+  let wanted;
+  const herdr = fakeHerdr("/none", (args) => {
+    if (args[1] === "prompt" && args.includes("--wait")) {
+      wanted = /exactly as (\S+)/.exec(args[3])[1];
+      writeFileSync(wanted, "x".repeat(500)); // the agent writes it anyway
+      return { code: 1, stdout: "", stderr: "", json: { error: { code: "agent_prompt_stalled" } } };
+    }
+    return undefined;
+  });
+  const r = await handoff({ agent: agent(), tokens: 160000, config, herdr, log: quiet, existingNames: new Set(), sleep: async () => {} });
+  assert.equal(r.ok, true);
+  assert.equal(r.path, wanted);
+});
+
+test("handoff: codex review screen is closed with Escape before prompting, never trusted", async () => {
+  const { config } = setup();
+  mkdirSync(config.handoffDir, { recursive: true });
+  let screens = 0;
+  const herdr = fakeHerdr("/none", (args) => {
+    if (args[1] === "read" && args.includes("visible")) {
+      return { code: 0, stdout: screens++ === 0 ? "Hooks  1 hook needs review  t trust all" : "Ask Codex to do anything", stderr: "" };
+    }
+    if (args[1] === "prompt" && args.includes("--wait")) {
+      writeFileSync(/exactly as (\S+)/.exec(args[3])[1], "x".repeat(500));
+    }
+    return undefined;
+  });
+  await handoff({ agent: agent({ agent: "codex", name: "x1" }), tokens: 180000, config, herdr, log: quiet, existingNames: new Set(), sleep: async () => {} });
+  const keys = herdr.calls.filter((c) => c[1] === "send-keys").map((c) => c.slice(3).join(" "));
+  assert.ok(keys.includes("Escape"));
+  assert.ok(!keys.some((k) => /\bt\b/i.test(k)));
+  const firstEsc = herdr.calls.findIndex((c) => c[1] === "send-keys");
+  const firstPrompt = herdr.calls.findIndex((c) => c[1] === "prompt");
+  assert.ok(firstEsc < firstPrompt);
 });
