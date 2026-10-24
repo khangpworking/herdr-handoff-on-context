@@ -19,7 +19,7 @@ import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, appendFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
-import { readContext, sessionPathFromProcesses, SUPPORTED_KINDS } from "./readers.js";
+import { readContext, codexRolloutFor, processStartMs, SUPPORTED_KINDS } from "./readers.js";
 
 const HOME = homedir();
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -262,11 +262,24 @@ export async function handoff({ agent, tokens, config, herdr, log, existingNames
   return { ok: true, path, newPane, newName, oldClosed: !config.keepOld };
 }
 
+// Codex without a herdr session: match its rollout by cwd + process start.
+// Skipped when another codex agent shares the cwd, because the match would be
+// ambiguous.
+export async function codexRolloutForPane(agent, herdr, agents) {
+  const cwd = agent.foreground_cwd || agent.cwd;
+  const sameCwd = agents.filter((a) => a.agent === "codex" && (a.foreground_cwd || a.cwd) === cwd);
+  if (sameCwd.length > 1) return undefined;
+  const info = await herdr(["pane", "process-info", "--pane", agent.pane_id]);
+  const proc = (info.json?.result?.process_info?.foreground_processes ?? []).find((p) => p.name === "codex") ;
+  if (!proc) return undefined;
+  return codexRolloutFor(cwd, processStartMs(proc.pid));
+}
+
 // ---------------------------------------------------------------------------
 // One poll
 // ---------------------------------------------------------------------------
 
-export async function pollOnce({ config, herdr, log, state, read = readContext, doHandoff = handoff, findFromProcesses = sessionPathFromProcesses }) {
+export async function pollOnce({ config, herdr, log, state, read = readContext, doHandoff = handoff, findCodexRollout = codexRolloutForPane }) {
   const listed = await herdr(["agent", "list"]);
   const agents = listed.json?.result?.agents;
   if (!Array.isArray(agents)) {
@@ -275,11 +288,9 @@ export async function pollOnce({ config, herdr, log, state, read = readContext, 
   const names = new Set(agents.map((a) => a.name).filter(Boolean));
   const rows = [];
   for (const agent of agents) {
-    if (!agent.agent_session && config.kinds.includes(agent.agent)) {
-      const info = await herdr(["pane", "process-info", "--pane", agent.pane_id]);
-      const pids = (info.json?.result?.process_info?.foreground_processes ?? []).map((p) => p.pid);
-      const path = findFromProcesses(agent.agent, pids);
-      if (path) agent.agent_session = { kind: "path", value: path, source: "proc" };
+    if (!agent.agent_session && agent.agent === "codex" && config.kinds.includes("codex")) {
+      const path = await findCodexRollout(agent, herdr, agents);
+      if (path) agent.agent_session = { kind: "path", value: path, source: "rollout-match" };
     }
     let tokens;
     try {

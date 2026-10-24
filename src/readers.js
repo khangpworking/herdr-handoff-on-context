@@ -10,7 +10,7 @@
 //   claude, codex, pi -> kind "path" (a JSONL transcript)
 //   opencode          -> kind "id"   (a row key in ~/.local/share/opencode/opencode.db)
 
-import { openSync, readSync, fstatSync, closeSync, existsSync, readdirSync, readlinkSync, readFileSync } from "node:fs";
+import { openSync, readSync, fstatSync, closeSync, existsSync, readdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -170,44 +170,63 @@ export function resolveSessionPath(agent, env = process.env) {
   return found;
 }
 
-// Fallback when herdr has no session for an agent (for example, Codex shows
-// its SessionStart hook for review and does not run it until approved). Codex
-// keeps its rollout file open, so look through the open files of the pane's
-// foreground processes and their children (Linux /proc only).
-export function sessionPathFromProcesses(kind, pids, env = process.env, procRoot = "/proc") {
-  const where = sessionRoots(env)[kind];
-  if (!where) return undefined;
-  const seen = new Set();
-  const queue = [...pids];
-  while (queue.length) {
-    const pid = queue.shift();
-    if (!pid || seen.has(pid)) continue;
-    seen.add(pid);
-    let fds = [];
+// Fallback for Codex when herdr has no session (Codex does not run its herdr
+// SessionStart hook until the hook is approved in its review screen). Codex
+// 0.16x keeps rollouts open in a shared daemon, so open files cannot map a
+// pane to a session. Instead match the rollout header (session_meta): same
+// cwd, started at or after the pane's codex process. The newest match wins,
+// which also follows /new inside the same process.
+export function processStartMs(pid, procRoot = "/proc") {
+  try {
+    const stat = readFileSync(join(procRoot, String(pid), "stat"), "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    const ticks = Number(fields[19]); // field 22 overall: starttime
+    const btime = Number(/^btime (\d+)/m.exec(readFileSync(join(procRoot, "stat"), "utf8"))[1]);
+    return (btime + ticks / 100) * 1000; // USER_HZ is 100 on Linux
+  } catch {
+    return undefined;
+  }
+}
+
+function firstLine(path, maxBytes = 256 * 1024) {
+  const fd = openSync(path, "r");
+  try {
+    const buf = Buffer.alloc(maxBytes);
+    const len = readSync(fd, buf, 0, maxBytes, 0);
+    return buf.subarray(0, len).toString("utf8").split("\n")[0];
+  } finally {
+    closeSync(fd);
+  }
+}
+
+export function codexRolloutFor(cwd, startMs, env = process.env, nowMs = Date.now()) {
+  if (!cwd || !startMs) return undefined;
+  const root = sessionRoots(env).codex.root;
+  let best;
+  // Today and the days back to the process start (rollouts nest by YYYY/MM/DD).
+  for (let t = nowMs; t >= startMs - 86_400_000; t -= 86_400_000) {
+    const d = new Date(t);
+    const dir = join(root, String(d.getFullYear()), String(d.getMonth() + 1).padStart(2, "0"), String(d.getDate()).padStart(2, "0"));
+    let names = [];
     try {
-      fds = readdirSync(join(procRoot, String(pid), "fd"));
+      names = readdirSync(dir).filter((n) => n.startsWith("rollout-") && n.endsWith(".jsonl"));
     } catch {
       continue;
     }
-    for (const fd of fds) {
-      let target;
+    for (const name of names) {
+      const full = join(dir, name);
+      let meta;
       try {
-        target = readlinkSync(join(procRoot, String(pid), "fd", fd));
+        meta = JSON.parse(firstLine(full))?.payload;
       } catch {
         continue;
       }
-      if (target.startsWith(where.root) && target.endsWith(".jsonl")) return target;
-    }
-    try {
-      for (const task of readdirSync(join(procRoot, String(pid), "task"))) {
-        const kids = readFileSync(join(procRoot, String(pid), "task", task, "children"), "utf8").trim();
-        if (kids) queue.push(...kids.split(/\s+/).map(Number));
-      }
-    } catch {
-      // no children info
+      const created = Date.parse(meta?.timestamp ?? "");
+      if (meta?.cwd !== cwd || !(created >= startMs - 5000)) continue;
+      if (!best || created > best.created) best = { full, created };
     }
   }
-  return undefined;
+  return best?.full;
 }
 
 // agent: a herdr AgentInfo. Returns a token count, or undefined when unknown.

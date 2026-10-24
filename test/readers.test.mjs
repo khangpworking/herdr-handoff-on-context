@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { claudeContext, codexContext, piContext, opencodeTokens, readContext, resolveSessionPath } from "../src/readers.js";
+import { claudeContext, codexContext, piContext, opencodeTokens, readContext, resolveSessionPath, codexRolloutFor } from "../src/readers.js";
 
 const j = (...objs) => objs.map((o) => JSON.stringify(o));
 
@@ -51,6 +51,22 @@ test("resolveSessionPath: claude session id -> transcript under projects/", () =
   const agent = { agent: "claude", agent_session: { kind: "id", value: "abc-123" } };
   assert.equal(resolveSessionPath(agent, { CLAUDE_CONFIG_DIR: home }), file);
   assert.equal(resolveSessionPath({ ...agent, agent_session: { kind: "id", value: "nope" } }, { CLAUDE_CONFIG_DIR: home }), undefined);
+});
+
+test("codexRolloutFor: newest rollout for this cwd started after the process", () => {
+  const home = mkdtempSync(join(tmpdir(), "cx-"));
+  const now = Date.parse("2026-10-24T14:00:00Z");
+  const d = new Date(now);
+  const dir = join(home, "sessions", String(d.getFullYear()), String(d.getMonth() + 1).padStart(2, "0"), String(d.getDate()).padStart(2, "0"));
+  mkdirSync(dir, { recursive: true });
+  const write = (name, cwd, ts) => writeFileSync(join(dir, name), JSON.stringify({ type: "session_meta", payload: { cwd, timestamp: ts } }) + "\n");
+  write("rollout-a.jsonl", "/repo", "2026-10-24T13:00:00Z"); // before the process started
+  write("rollout-b.jsonl", "/other", "2026-10-24T13:40:00Z"); // other folder
+  write("rollout-c.jsonl", "/repo", "2026-10-24T13:31:00Z");
+  write("rollout-d.jsonl", "/repo", "2026-10-24T13:45:00Z"); // after /new
+  const start = Date.parse("2026-10-24T13:30:00Z");
+  assert.equal(codexRolloutFor("/repo", start, { CODEX_HOME: home }, now), join(dir, "rollout-d.jsonl"));
+  assert.equal(codexRolloutFor("/none", start, { CODEX_HOME: home }, now), undefined);
 });
 
 test("readContext: opencode goes by session id", async () => {
