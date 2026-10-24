@@ -38,7 +38,11 @@ function fakeHerdr(handoffFile, respond = () => undefined) {
     if (custom) return custom;
     const [a, b] = args;
     if (a === "agent" && b === "prompt") return { code: 0, stdout: "", stderr: "", json: { result: { agent: { agent_status: "done" } } } };
-    if (a === "agent" && b === "read") return { code: 0, stdout: `done\nHANDOFF: ${handoffFile}\n`, stderr: "" };
+    if (a === "agent" && b === "read") {
+      // Echo every prompt sent so far, like a TUI transcript, plus the HANDOFF line.
+      const sent = calls.filter((c) => c[1] === "prompt").map((c) => c[3]).join("\n");
+      return { code: 0, stdout: `${sent}\ndone\nHANDOFF: ${handoffFile}\nAsk Codex to do anything\n`, stderr: "" };
+    }
     if (a === "pane" && b === "split") return { code: 0, stdout: "", stderr: "", json: { result: { pane: { pane_id: "w1:p9" } } } };
     return { code: 0, stdout: "", stderr: "" };
   };
@@ -105,16 +109,20 @@ test("handoff: agent blocked while writing -> nothing split, nothing closed", as
   assert.equal(herdr.did("pane", "close"), false);
 });
 
-test("handoff: new agent never works -> old pane kept", async () => {
+test("handoff: new agent never shows the handoff -> retried once, old pane kept", async () => {
   const { dir, config } = setup();
   // Inside the handoff dir, so the newest-file fallback also finds it on Windows.
   mkdirSync(config.handoffDir, { recursive: true });
   const file = join(config.handoffDir, "h.md");
   writeFileSync(file, "x".repeat(500));
-  const herdr = fakeHerdr(file, (args) => (args[1] === "wait" ? { code: 1, stdout: "", stderr: "timeout" } : undefined));
+  // The new agent's screen never shows the handoff prompt (e.g. swallowed by an overlay).
+  const herdr = fakeHerdr(file, (args) =>
+    args[1] === "read" && args[2] === "c1-h2" ? { code: 0, stdout: "empty conversation", stderr: "" } : undefined,
+  );
   const r = await handoff({ agent: agent(), tokens: 160000, config, herdr, log: quiet, existingNames: new Set(), sleep: async () => {} });
   assert.equal(r.ok, false);
   assert.equal(r.step, "confirm");
+  assert.equal(herdr.calls.filter((c) => c[1] === "prompt" && c[2] === "c1-h2").length, 2); // one retry
   assert.equal(herdr.did("pane", "close"), false);
 });
 

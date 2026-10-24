@@ -18,7 +18,7 @@
 import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync, appendFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { readContext, codexRolloutFor, processStartMs, SUPPORTED_KINDS } from "./readers.js";
 
 const HOME = homedir();
@@ -209,17 +209,41 @@ export function resumePrompt(path) {
 // ---------------------------------------------------------------------------
 
 // Codex shows a hook-review screen at startup while a configured hook is not
-// trusted, and that screen swallows typed prompts. Esc closes it without
-// trusting anything.
-const CODEX_OVERLAY = /hook needs review|review required|Lifecycle hooks from config/i;
+// trusted, and that screen swallows typed prompts. It can appear a few
+// seconds after the input box, and narrow panes cut its text, so match short
+// phrases. Esc closes it without trusting anything; never send "t".
+const CODEX_OVERLAY = /t trust|needs review|review required|Lifecycle hooks/i;
+const CODEX_READY = /Ask Codex/i;
 
-export async function clearCodexOverlay(herdr, target, sleep = sleepMs) {
-  for (let i = 0; i < 3; i++) {
-    const screen = await herdr(["agent", "read", target, "--source", "visible"]);
-    if (!CODEX_OVERLAY.test(screen.stdout)) return;
-    await herdr(["agent", "send-keys", target, "Escape"]);
-    await sleep(800);
+export async function clearCodexOverlay(herdr, target, sleep = sleepMs, timeoutMs = 20_000) {
+  const deadline = Date.now() + timeoutMs;
+  let clean = 0;
+  while (Date.now() < deadline) {
+    const screen = (await herdr(["agent", "read", target, "--source", "visible"])).stdout;
+    if (CODEX_OVERLAY.test(screen)) {
+      clean = 0;
+      await herdr(["agent", "send-keys", target, "Escape"]);
+    } else if (CODEX_READY.test(screen)) {
+      if (++clean >= 2) return true;
+    }
+    await sleep(1500);
   }
+  return false;
+}
+
+// The new agent took the handoff when the file name shows up in its
+// conversation (the echoed prompt, then its reads). herdr's "working" state
+// alone is not proof: it was reported while Codex's review screen had
+// swallowed the prompt.
+export async function sawHandoff(herdr, target, path, timeoutMs, sleep = sleepMs) {
+  const needle = basename(path);
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const out = (await herdr(["agent", "read", target, "--source", "recent-unwrapped", "--lines", "300"])).stdout;
+    if (out.includes(needle)) return true;
+    await sleep(2000);
+  }
+  return false;
 }
 
 // Wait until the handoff file exists and stops growing.
@@ -231,19 +255,6 @@ export async function waitForFile(path, timeoutMs, sleep = sleepMs) {
     if (size >= 200 && size === lastSize) return true;
     lastSize = size;
     await sleep(3000);
-  }
-  return false;
-}
-
-// `agent wait` fails fast with agent_not_found while the new agent is still
-// registering, so retry short slices until the deadline (from the original).
-export async function confirmWorking(herdr, target, timeoutMs, sleep = sleepMs) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    const slice = Math.min(5000, Math.max(200, deadline - Date.now()));
-    const r = await herdr(["agent", "wait", target, "--until", "working", "--timeout", String(slice)], slice + 5000);
-    if (r.code === 0) return true;
-    await sleep(300);
   }
   return false;
 }
@@ -296,15 +307,15 @@ export async function handoff({ agent, tokens, config, herdr, log, existingNames
     return { ok: false, step: "start", path, newPane, detail: (started.stderr || started.stdout).slice(0, 300) };
   }
 
-  // 4. Hand over the file and confirm the new agent took it.
-  if (agent.agent === "codex") {
-    await sleep(3000);
-    await clearCodexOverlay(herdr, newName, sleep);
+  // 4. Hand over the file and confirm the new agent took it (one retry).
+  let confirmed = false;
+  for (let attempt = 0; attempt < 2 && !confirmed; attempt++) {
+    if (agent.agent === "codex") await clearCodexOverlay(herdr, newName, sleep);
+    await herdr(["agent", "prompt", newName, resumePrompt(path)]);
+    confirmed = await sawHandoff(herdr, newName, path, config.confirmTimeoutMs / 2, sleep);
   }
-  await herdr(["agent", "prompt", newName, resumePrompt(path)]);
-  const confirmed = await confirmWorking(herdr, newName, config.confirmTimeoutMs, sleep);
   if (!confirmed) {
-    return { ok: false, step: "confirm", path, newPane, newName, detail: "new agent never reported working; old pane kept" };
+    return { ok: false, step: "confirm", path, newPane, newName, detail: "new agent never showed the handoff prompt; old pane kept" };
   }
 
   // 5. Retire the old session.
