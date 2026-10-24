@@ -10,7 +10,7 @@
 //   claude, codex, pi -> kind "path" (a JSONL transcript)
 //   opencode          -> kind "id"   (a row key in ~/.local/share/opencode/opencode.db)
 
-import { openSync, readSync, fstatSync, closeSync, existsSync, readdirSync } from "node:fs";
+import { openSync, readSync, fstatSync, closeSync, existsSync, readdirSync, readlinkSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -168,6 +168,46 @@ export function resolveSessionPath(agent, env = process.env) {
   const found = findFile(where.root, (name) => where.match(name, s.value), 3);
   if (found) pathCache.set(key, found);
   return found;
+}
+
+// Fallback when herdr has no session for an agent (for example, Codex shows
+// its SessionStart hook for review and does not run it until approved). Codex
+// keeps its rollout file open, so look through the open files of the pane's
+// foreground processes and their children (Linux /proc only).
+export function sessionPathFromProcesses(kind, pids, env = process.env, procRoot = "/proc") {
+  const where = sessionRoots(env)[kind];
+  if (!where) return undefined;
+  const seen = new Set();
+  const queue = [...pids];
+  while (queue.length) {
+    const pid = queue.shift();
+    if (!pid || seen.has(pid)) continue;
+    seen.add(pid);
+    let fds = [];
+    try {
+      fds = readdirSync(join(procRoot, String(pid), "fd"));
+    } catch {
+      continue;
+    }
+    for (const fd of fds) {
+      let target;
+      try {
+        target = readlinkSync(join(procRoot, String(pid), "fd", fd));
+      } catch {
+        continue;
+      }
+      if (target.startsWith(where.root) && target.endsWith(".jsonl")) return target;
+    }
+    try {
+      for (const task of readdirSync(join(procRoot, String(pid), "task"))) {
+        const kids = readFileSync(join(procRoot, String(pid), "task", task, "children"), "utf8").trim();
+        if (kids) queue.push(...kids.split(/\s+/).map(Number));
+      }
+    } catch {
+      // no children info
+    }
+  }
+  return undefined;
 }
 
 // agent: a herdr AgentInfo. Returns a token count, or undefined when unknown.
