@@ -59,6 +59,15 @@ Commands: `watch` (default, loop), `status` (print context per agent), `once` (o
 | `HERDR_HANDOFF_DRY_RUN` | off |
 | `HERDR_HANDOFF_LOG` | `~/.local/state/herdr-handoff/watch.log` |
 
+## Agent quirks handled
+
+- **Claude** reports a session **id** to Herdr; the watcher finds the transcript under `~/.claude/projects/`.
+- **Codex** does not run Herdr's `SessionStart` hook until you approve it in Codex's hook-review screen, so Herdr may have no session for it. The watcher then matches the rollout header (same cwd, started after the pane's `codex` process). It skips the match when two Codex agents share a cwd.
+- **Codex review screen** swallows typed prompts. The watcher presses **Esc** (it never trusts a hook) until the input box is back.
+- **Confirmation**: a handoff counts only when the handoff file name shows up in the new agent's transcript. Herdr's `working` state alone was wrong once in testing. The prompt is resent once if needed.
+
+Tested live on herdr 0.9.5 with claude 2.1.309, codex 0.164.0, opencode 1.19.4 and pi 1.4.0: all four handed off, and each new session recalled a codeword that only the old session had.
+
 ## Limits
 
 - The new session starts with the agent's **default** model and flags, not what you switched to mid-session.
