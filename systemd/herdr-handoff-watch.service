@@ -1,0 +1,16 @@
+[Unit]
+Description=Hand herdr agents off to a fresh session before their context fills
+
+[Service]
+# Edit the path to where you cloned this repo.
+ExecStart=/usr/bin/env node %h/herdr-handoff-on-context/bin/herdr-handoff-watch.js
+# herdr and the agent CLIs usually live in ~/.local/bin.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Optional overrides, see README:
+# Environment=HERDR_HANDOFF_THRESHOLD=170000
+# Environment=HERDR_HANDOFF_KEEP_OLD=1
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
